@@ -194,3 +194,103 @@ class JudgeClient(object):
         self_dict = self.__dict__.copy()
         del self_dict["_pool"]
         return self_dict
+
+class SelfTest(object):
+    def __init__(self, run_config, exe_path, max_cpu_time, max_memory, test_case_dir,
+                 submission_dir, output=True):
+        self._run_config = run_config
+        self._exe_path = exe_path
+        self._max_cpu_time = max_cpu_time
+        self._max_memory = max_memory
+        self._max_real_time = self._max_cpu_time * 3
+        self._test_case_dir = test_case_dir
+        self._submission_dir = submission_dir
+
+        self._pool = Pool(processes=psutil.cpu_count())
+        self._test_case_info = self._load_test_case_info()
+
+        self._output = output
+
+    def _load_test_case_info(self):
+        try:
+            with open(os.path.join(self._test_case_dir, "info")) as f:
+                return json.load(f)
+        except IOError:
+            raise JudgeClientError("Test case not found")
+        except ValueError:
+            raise JudgeClientError("Bad test case config")
+
+    def _compare_output(self, user_output_file):
+        with open(user_output_file, "rb") as f:
+            content = f.read()
+        output_md5 = hashlib.md5(content.rstrip()).hexdigest()
+        result = output_md5 == self._test_case_info["stripped_output_md5"]
+        return output_md5, result
+
+    def _judge_one(self, ):
+        in_file = os.path.join(self._test_case_dir, self._test_case_info["input_name"])
+
+        real_user_output_file = user_output_file = os.path.join(self._submission_dir, "self_test.out")
+        kwargs = {"input_path": in_file, "output_path": real_user_output_file, "error_path": real_user_output_file}
+        
+        command = self._run_config["command"].format(exe_path=self._exe_path, exe_dir=os.path.dirname(self._exe_path),
+                                                     max_memory=int(self._max_memory / 1024))
+        command = shlex.split(command)
+        env = ["PATH=" + os.environ.get("PATH", "")] + self._run_config.get("env", [])
+
+        run_result = _judger.run(max_cpu_time=self._max_cpu_time,
+                                max_real_time=self._max_real_time,
+                                max_memory=self._max_memory,
+                                #  max_stack=128 * 1024 * 1024,
+                                #  max_output_size=max(self._test_case_info.get("output_size", 0) * 2, 1024 * 1024 * 16),
+                                max_stack=128 * 1024 * 1024,
+                                max_output_size=20 * 1024 * 1024,
+                                max_process_number=_judger.UNLIMITED,
+                                exe_path=command[0],
+                                args=command[1::],
+                                env=env,
+                                log_path=JUDGER_RUN_LOG_PATH,
+                                seccomp_rule_name=None,
+                                uid=RUN_USER_UID,
+                                gid=RUN_GROUP_GID,
+                                **kwargs)
+        run_result["test_case"] = 'self_test'
+
+        # if progress exited normally, then we should check output result
+        run_result["output_md5"] = None
+        run_result["output"] = None
+        if run_result["result"] == _judger.RESULT_SUCCESS:
+            if not os.path.exists(user_output_file):
+                run_result["result"] = _judger.RESULT_WRONG_ANSWER
+            else:
+                run_result["output_md5"], is_ac = self._compare_output(user_output_file)
+                # -1 == Wrong Answer
+                if not is_ac:
+                    run_result["result"] = _judger.RESULT_WRONG_ANSWER
+
+        if self._output:
+            try:
+                with open(user_output_file, "rb") as f:
+                    run_result["output"] = f.read().decode("utf-8", errors="backslashreplace")
+            except Exception:
+                pass
+
+        return run_result
+        
+    def run(self):
+        tmp_result = []
+        result = None
+        tmp_result.append(self._pool.apply_async(_run, (self, None)))
+        self._pool.close()
+        self._pool.join()
+        for item in tmp_result:
+            # exception will be raised, when get() is called
+            # # http://stackoverflow.com/questions/22094852/how-to-catch-exceptions-in-workers-in-multiprocessing
+            result = item.get()
+        return result
+
+    def __getstate__(self):
+        # http://stackoverflow.com/questions/25382455/python-notimplementederror-pool-objects-cannot-be-passed-between-processes
+        self_dict = self.__dict__.copy()
+        del self_dict["_pool"]
+        return self_dict

@@ -10,7 +10,7 @@ from compiler import Compiler
 from config import (JUDGER_WORKSPACE_BASE, SPJ_SRC_DIR, SPJ_EXE_DIR, COMPILER_USER_UID, SPJ_USER_UID,
                     RUN_USER_UID, RUN_GROUP_GID, TEST_CASE_DIR)
 from exception import TokenVerificationFailed, CompileError, SPJCompileError, JudgeClientError
-from judge_client import JudgeClient
+from judge_client import JudgeClient, SelfTest
 from utils import server_info, logger, token, ProblemIOMode
 
 app = Flask(__name__)
@@ -176,11 +176,91 @@ class JudgeServer:
             raise SPJCompileError(e.message)
         return "success"
 
+    @classmethod
+    def self_test(cls, language_config, src, max_cpu_time, max_memory, test_case, 
+                    output=True):
+
+        # init
+        compile_config = language_config.get("compile")
+        run_config = language_config["run"]
+        submission_id = uuid.uuid4().hex
+        init_test_case_dir = True
+        with InitSubmissionEnv(JUDGER_WORKSPACE_BASE, submission_id=str(submission_id), init_test_case_dir=init_test_case_dir) as dirs:
+            submission_dir, test_case_dir = dirs
+            if compile_config:
+                src_path = os.path.join(submission_dir, compile_config["src_name"])
+
+                # write source code into file
+                with open(src_path, "w", encoding="utf-8") as f:
+                    f.write(src)
+                os.chown(src_path, COMPILER_USER_UID, 0)
+                os.chmod(src_path, 0o400)
+
+                # compile source code, return exe file path
+                exe_path = Compiler().compile(compile_config=compile_config,
+                                                src_path=src_path,
+                                                output_dir=submission_dir)
+
+                try:
+                    # Java exe_path is SOME_PATH/Main, but the real path is SOME_PATH/Main.class
+                    # We ignore it temporarily
+                    os.chown(exe_path, RUN_USER_UID, 0)
+                    os.chmod(exe_path, 0o500)
+                except Exception:
+                    pass
+            else:
+                exe_path = os.path.join(submission_dir, run_config["exe_name"])
+                with open(exe_path, "w", encoding="utf-8") as f:
+                    f.write(src)
+            # write test case
+            item_info = {}
+
+            input_name = "1.in"
+            item_info["input_name"] = input_name
+            input_data = test_case["input"].encode("utf-8")
+            item_info["input_size"] = len(input_data)
+
+            with open(os.path.join(test_case_dir, input_name), "wb") as f:
+                f.write(input_data)
+
+            output_name = "1.out"
+            item_info["output_name"] = output_name
+            output_data = test_case["output"].encode("utf-8")
+            item_info["output_md5"] = hashlib.md5(output_data).hexdigest()
+            item_info["output_size"] = len(output_data)
+            item_info["stripped_output_md5"] = hashlib.md5(output_data.rstrip()).hexdigest()
+
+            with open(os.path.join(test_case_dir, output_name), "wb") as f:
+                f.write(output_data)
+
+            '''
+            {
+                'input_name':'1.in',
+                'input_size':,
+                'output_name':,
+                'output_md5':,
+                'output_size':,
+                'stripped_output_md5':,
+            }
+            '''
+            with open(os.path.join(test_case_dir, "info"), "w") as f:
+                json.dump(item_info, f)
+
+            self_test_runner = SelfTest(run_config=language_config["run"],
+                                        exe_path=exe_path,
+                                        max_cpu_time=max_cpu_time,
+                                        max_memory=max_memory,
+                                        test_case_dir=test_case_dir,
+                                        submission_dir=submission_dir,
+                                        )
+            run_result = self_test_runner.run()
+
+            return run_result
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>', methods=["POST"])
 def server(path):
-    if path in ("judge", "ping", "compile_spj"):
+    if path in ("judge", "ping", "compile_spj", 'self_test'):
         _token = request.headers.get("X-Judge-Server-Token")
         try:
             if _token != token:
